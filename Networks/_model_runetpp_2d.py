@@ -1,157 +1,88 @@
-from __future__ import absolute_import
-
-from Networks.layer_utils import *
+import tensorflow as tf
+from Networks.arch_utils1 import *
 from Networks.activations import GELU, Snake
 from Networks._backbone_zoo import backbone_zoo, bach_norm_checker
 
-from tensorflow.keras.layers import Input
-from tensorflow.keras.models import Model
-
-def UNET_left(X, channel, kernel_size=3, stack_num=2, activation='ReLU', 
-              pool=True, batch_norm=False, name='left0'):
-    
+def UNET_left_block(inputs, channel, kernel_size=3, stack_num=2, activation='ReLU', 
+                    pool=True, batch_norm=False, block_name='left0'):
     pool_size = 2
-    
-    X = encode_layer(X, channel, pool_size, pool, activation=activation, 
-                     batch_norm=batch_norm, name='{}_encode'.format(name))
+    input_ten = encode_block(inputs, channel, pool_size, pool, activation=activation, 
+                     apply_batch_norm=batch_norm, block_name='{}_encode'.format(block_name))
+    input_ten = convolutional_stack(input_ten, channel, kernel_size, stack_count=stack_num, activation=activation, 
+                   apply_batch_norm=batch_norm, block_name='{}_conv'.format(block_name))
+    return input_ten
 
-    X = CONV_stack(X, channel, kernel_size, stack_num=stack_num, activation=activation, 
-                   batch_norm=batch_norm, name='{}_conv'.format(name))
-    
-    return X
-
-
-def UNET_right(X, X_list, channel, kernel_size=3, 
-               stack_num=2, activation='ReLU',
-               unpool=True, batch_norm=False, concat=True, name='right0'):
-    
-   
-    
+def UNET_right_block(inputs, skip_connections, channel, kernel_size=3, 
+                     stack_num=2, activation='ReLU', unpool=True, batch_norm=False, 
+                     concat=True, block_name='right0'):
     pool_size = 2
-    
-    X = decode_layer(X, channel, pool_size, unpool, 
-                     activation=activation, batch_norm=batch_norm, name='{}_decode'.format(name))
-    
-    # linear convolutional layers before concatenation
-    X = CONV_stack(X, channel, kernel_size, stack_num=1, activation=activation, 
-                   batch_norm=batch_norm, name='{}_conv_before_concat'.format(name))
+    input_ten = decode_block(inputs, channel, pool_size, unpool, activation=activation, 
+                     apply_batch_norm=batch_norm, block_name='{}_decode'.format(block_name))
+    input_ten = convolutional_stack(input_ten, channel, kernel_size, stack_count=1, activation=activation, 
+                   apply_batch_norm=batch_norm, block_name='{}_conv_before_concat'.format(block_name))
     if concat:
-        # <--- *stacked convolutional can be applied here
-        X = concatenate([X,]+X_list, axis=3, name=name+'_concat')
-    
-    # Stacked convolutions after concatenation 
-    X = CONV_stack(X, channel, kernel_size, stack_num=stack_num, activation=activation, 
-                   batch_norm=batch_norm, name=name+'_conv_after_concat')
-    
-    return X
+        input_ten = tf.keras.layers.concatenate([input_ten,] + skip_connections, axis=3, name=block_name+'_concat')
+    input_ten = convolutional_stack(input_ten, channel, kernel_size, stack_count=stack_num, activation=activation, 
+                   apply_batch_norm=batch_norm, block_name=block_name+'_conv_after_concat')
+    return input_ten
 
-def runetpp_2d_base(input_tensor, filter_num, stack_num_down=2, stack_num_up=2, 
-                 activation='ReLU', batch_norm=False, pool=True, unpool=True, 
-                 backbone=None, weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='unet'):
-    
-   
-    
+def runetpp_2d_base_block(input_tensor, filter_num, stack_num_down=2, stack_num_up=2, 
+                          activation='ReLU', batch_norm=False, pool=True, unpool=True, 
+                          backbone=None, weights='imagenet', freeze_backbone=True, 
+                          freeze_batch_norm=True, block_name='unet'):
     activation_func = eval(activation)
-
-    X_skip = []
-    depth_ = len(filter_num)
-
-    # no backbone cases
-    if backbone is None:
-
-        X = input_tensor
-
-        # stacked conv2d before downsampling
-        X = CONV_stack(X, filter_num[0], stack_num=stack_num_down, activation=activation, 
-                       batch_norm=batch_norm, name='{}_down0'.format(name))
-        X_skip.append(X)
-
-        # downsampling blocks
-        for i, f in enumerate(filter_num[1:]):
-            X = UNET_left(X, f, stack_num=stack_num_down, activation=activation, pool=pool, 
-                          batch_norm=batch_norm, name='{}_down{}'.format(name, i+1))  
-            X_residual = X
-            X = X+X_residual
-            X_skip.append(X)
-
-    # backbone cases
-    else:
-        # handling VGG16 and VGG19 separately
-        if 'VGG' in backbone:
-            backbone_ = backbone_zoo(backbone, weights, input_tensor, depth_, freeze_backbone, freeze_batch_norm)
-            # collecting backbone feature maps
-            X_skip = backbone_([input_tensor,])
-            depth_encode = len(X_skip)
-            
-        # for other backbones
-        else:
-            backbone_ = backbone_zoo(backbone, weights, input_tensor, depth_-1, freeze_backbone, freeze_batch_norm)
-            # collecting backbone feature maps
-            X_skip = backbone_([input_tensor,])
-            depth_encode = len(X_skip) + 1
-
-
-        # extra conv2d blocks are applied
-        # if downsampling levels of a backbone < user-specified downsampling levels
-        if depth_encode < depth_:
-
-            # begins at the deepest available tensor  
-            X = X_skip[-1]
-
-            # extra downsamplings
-            for i in range(depth_-depth_encode):
-                i_real = i + depth_encode
-
-                X = UNET_left(X, filter_num[i_real], stack_num=stack_num_down, activation=activation, pool=pool, 
-                              batch_norm=batch_norm, name='{}_down{}'.format(name, i_real+1))
-                X_skip.append(X)
-
-    # reverse indexing encoded feature maps
-    X_skip = X_skip[::-1]
-    # upsampling begins at the deepest available tensor
-    X = X_skip[0]
-    # other tensors are preserved for concatenation
-    X_decode = X_skip[1:]
-    depth_decode = len(X_decode)
-
-    # reverse indexing filter numbers
+    skip_connections = []
+    input_ten = input_tensor
+    
+    input_ten = convolutional_stack(input_ten, filter_num[0], stack_count=stack_num_down, activation=activation, 
+                   apply_batch_norm=batch_norm, block_name='{}_down0'.format(block_name))
+    skip_connections.append(input_ten)
+    
+    for i, f in enumerate(filter_num[1:]):
+        input_ten = UNET_left_block(input_ten, f, stack_num=stack_num_down, activation=activation, 
+                            pool=pool, batch_norm=batch_norm, block_name='{}_down{}'.format(block_name, i+1))
+        input_ten_residual = input_ten
+        input_ten = input_ten + input_ten_residual
+        skip_connections.append(input_ten)
+    
+    skip_connections = skip_connections[::-1]
+    input_ten = skip_connections[0]
+    input_ten_decode = skip_connections[1:]
+    
     filter_num_decode = filter_num[:-1][::-1]
+    
+    for i in range(len(input_ten_decode)):
+        input_ten = UNET_right_block(input_ten, [input_ten_decode[i],], filter_num_decode[i], stack_num=stack_num_up, 
+                             activation=activation, unpool=unpool, batch_norm=batch_norm, 
+                             block_name='{}_up{}'.format(block_name, i))
+    
+    if len(input_ten_decode) < len(filter_num) - 1:
+        for i in range(len(filter_num) - len(input_ten_decode) - 1):
+            i_real = i + len(input_ten_decode)
+            input_ten = UNET_right_block(input_ten, None, filter_num_decode[i_real], stack_num=stack_num_up, 
+                                 activation=activation, unpool=unpool, batch_norm=batch_norm, 
+                                 concat=False, block_name='{}_up{}'.format(block_name, i_real))
+    return input_ten
 
-    # upsampling with concatenation
-    for i in range(depth_decode):
-        X = UNET_right(X, [X_decode[i],], filter_num_decode[i], stack_num=stack_num_up, activation=activation, 
-                       unpool=unpool, batch_norm=batch_norm, name='{}_up{}'.format(name, i))
-
-    # if tensors for concatenation is not enough
-    # then use upsampling without concatenation 
-    if depth_decode < depth_-1:
-        for i in range(depth_-depth_decode-1):
-            i_real = i + depth_decode
-            X = UNET_right(X, None, filter_num_decode[i_real], stack_num=stack_num_up, activation=activation, 
-                       unpool=unpool, batch_norm=batch_norm, concat=False, name='{}_up{}'.format(name, i_real))   
-    return X
-
-def runetpp_2d(input_size, filter_num =[64, 128, 256, 512, 1024], n_labels=2, stack_num_down=2, stack_num_up=2,
-            activation='ReLU', output_activation='Softmax', batch_norm=False, pool=True, unpool=True, 
-            backbone=None, weights='imagenet', freeze_backbone=True, freeze_batch_norm=True, name='runetpp'):
-   
+def runetpp_2d_model(input_size, filter_num=[64, 128, 256, 512, 1024], n_labels=2, 
+                     stack_num_down=2, stack_num_up=2, activation='ReLU', 
+                     output_activation='Softmax', batch_norm=False, pool=True, unpool=True, 
+                     backbone=None, weights=None, freeze_backbone=True, freeze_batch_norm=True, 
+                     model_name='runetpp'):
     activation_func = eval(activation)
     
     if backbone is not None:
         bach_norm_checker(backbone, batch_norm)
         
-    IN = Input(input_size)
+    inputs = tf.keras.layers.Input(input_size)
+    input_ten = runetpp_2d_base_block(inputs, filter_num, stack_num_down=stack_num_down, stack_num_up=stack_num_up, 
+                              activation=activation, batch_norm=batch_norm, pool=pool, unpool=unpool, 
+                              backbone=backbone, weights=weights, freeze_backbone=freeze_backbone, 
+                              freeze_batch_norm=freeze_backbone, block_name=model_name)
     
-    # base    
-    X = runetpp_2d_base(IN, filter_num, stack_num_down=stack_num_down, stack_num_up=stack_num_up, 
-                     activation=activation, batch_norm=batch_norm, pool=pool, unpool=unpool, 
-                     backbone=backbone, weights=weights, freeze_backbone=freeze_backbone, 
-                     freeze_batch_norm=freeze_backbone, name=name)
+    outputs = convolutional_output(input_ten, n_labels, kernel_size=1, activation=output_activation, 
+                          block_name='{}_output'.format(model_name))
     
-    # output layer
-    OUT = CONV_output(X, n_labels, kernel_size=1, activation=output_activation, name='{}_output'.format(name))
-    
-    # functional API model
-    model = Model(inputs=[IN,], outputs=[OUT,], name='{}_model'.format(name))
+    model = tf.keras.models.Model(inputs=[inputs,], outputs=[outputs,], name='{}_model'.format(model_name))
     
     return model
